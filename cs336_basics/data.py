@@ -9,8 +9,9 @@ import torch
 
 def get_batch(dataset: np.ndarray, batch_size: int, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
     starts = np.random.randint(0, len(dataset) - context_length, size=batch_size)
-    x = np.stack([dataset[s : s + context_length] for s in starts])
-    y = np.stack([dataset[s + 1 : s + context_length + 1] for s in starts])
+    offsets = np.arange(context_length)
+    x = dataset[starts[:, None] + offsets[None, :]]
+    y = dataset[starts[:, None] + offsets[None, :] + 1]
     return torch.tensor(x, dtype=torch.long, device=device), torch.tensor(y, dtype=torch.long, device=device)
 
 

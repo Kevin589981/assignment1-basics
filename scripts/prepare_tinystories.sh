@@ -18,6 +18,8 @@ TRAIN_NPY="${TRAIN_NPY:-$DATA_DIR/tinystories_train.npy}"
 VAL_NPY="${VAL_NPY:-$DATA_DIR/tinystories_val.npy}"
 VOCAB_SIZE="${VOCAB_SIZE:-10000}"
 DTYPE="${DTYPE:-uint16}"
+TOKENIZER_WORKERS="${TOKENIZER_WORKERS:-40}"
+ENCODE_WORKERS="${ENCODE_WORKERS:-40}"
 
 mkdir -p "$DATA_DIR"
 
@@ -32,6 +34,7 @@ if [[ ! -f "$TOKENIZER_OUT" ]]; then
     --output "$TOKENIZER_OUT" \
     --vocab-size "$VOCAB_SIZE" \
     --special-token "<|endoftext|>" \
+    --num-workers "$TOKENIZER_WORKERS" \
     --metadata "$DATA_DIR/tinystories_tokenizer_meta.json"
 else
   echo "exists: $TOKENIZER_OUT"
@@ -43,6 +46,8 @@ if [[ ! -f "$TRAIN_NPY" ]]; then
     --tokenizer "$TOKENIZER_OUT" \
     --output "$TRAIN_NPY" \
     --dtype "$DTYPE" \
+    --num-workers "$ENCODE_WORKERS" \
+    --split-mode special \
     --metadata "$DATA_DIR/tinystories_train_meta.json"
 else
   echo "exists: $TRAIN_NPY"
@@ -54,6 +59,8 @@ if [[ ! -f "$VAL_NPY" ]]; then
     --tokenizer "$TOKENIZER_OUT" \
     --output "$VAL_NPY" \
     --dtype "$DTYPE" \
+    --num-workers "$ENCODE_WORKERS" \
+    --split-mode special \
     --metadata "$DATA_DIR/tinystories_val_meta.json"
 else
   echo "exists: $VAL_NPY"

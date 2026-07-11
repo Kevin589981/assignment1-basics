@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Iterable
+import math
+import multiprocessing as mp
 import os
 
 import regex as re
@@ -19,6 +21,21 @@ def _special_pattern(special_tokens: list[str] | None) -> re.Pattern | None:
 
 def _pretokenize(text: str) -> list[bytes]:
     return [match.group(0).encode("utf-8") for match in PAT.finditer(text)]
+
+
+def _chunked(items: list[str], num_chunks: int) -> list[list[str]]:
+    if not items:
+        return []
+    chunk_size = max(1, math.ceil(len(items) / num_chunks))
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _count_pretokens_in_segments(segments: list[str]) -> Counter[tuple[bytes, ...]]:
+    counts: Counter[tuple[bytes, ...]] = Counter()
+    for segment in segments:
+        for pretoken in _pretokenize(segment):
+            counts[tuple(bytes([b]) for b in pretoken)] += 1
+    return counts
 
 
 class Tokenizer:
@@ -132,6 +149,7 @@ def train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
+    num_workers: int = 1,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     vocab = {i: bytes([i]) for i in range(256)}
     for token in special_tokens:
@@ -142,10 +160,16 @@ def train_bpe(
     with open(input_path, encoding="utf-8") as f:
         text = f.read()
 
-    word_counts: Counter[tuple[bytes, ...]] = Counter()
-    for segment in _split_specials(text, special_tokens):
-        for pretoken in _pretokenize(segment):
-            word_counts[tuple(bytes([b]) for b in pretoken)] += 1
+    segments = _split_specials(text, special_tokens)
+    if num_workers > 1 and len(segments) > 1:
+        chunks = _chunked(segments, num_workers * 4)
+        with mp.Pool(processes=num_workers) as pool:
+            partial_counts = pool.map(_count_pretokens_in_segments, chunks)
+        word_counts: Counter[tuple[bytes, ...]] = Counter()
+        for counts in partial_counts:
+            word_counts.update(counts)
+    else:
+        word_counts = _count_pretokens_in_segments(segments)
 
     pair_counts, pair_to_words = _build_pair_index(word_counts)
     merges: list[tuple[bytes, bytes]] = []

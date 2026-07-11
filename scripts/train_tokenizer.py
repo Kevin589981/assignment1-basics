@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vocab-size", type=int, required=True)
     parser.add_argument("--special-token", action="append", default=None)
     parser.add_argument("--metadata", default=None, help="Optional JSON metadata output path.")
+    parser.add_argument("--num-workers", type=int, default=1, help="Parallel workers for pre-tokenization.")
     return parser.parse_args()
 
 
@@ -28,7 +29,7 @@ def main() -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     start = time.time()
-    vocab, merges = train_bpe(args.input, args.vocab_size, special_tokens)
+    vocab, merges = train_bpe(args.input, args.vocab_size, special_tokens, num_workers=args.num_workers)
     elapsed = time.time() - start
     payload = {
         "vocab": vocab,
@@ -44,6 +45,7 @@ def main() -> None:
         "vocab_size": args.vocab_size,
         "special_tokens": special_tokens,
         "num_merges": len(merges),
+        "num_workers": args.num_workers,
         "elapsed_sec": elapsed,
     }
     if args.metadata is not None:

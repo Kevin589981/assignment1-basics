@@ -26,6 +26,7 @@ MIN_LR="${MIN_LR:-3e-5}"
 WARMUP_ITERS="${WARMUP_ITERS:-1000}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 SEED="${SEED:-42}"
+NUM_THREADS="${NUM_THREADS:-40}"
 
 "$PYTHON" scripts/train_lm.py \
   --train-data "$DATA_DIR/tinystories_train.npy" \
@@ -50,4 +51,5 @@ SEED="${SEED:-42}"
   --weight-decay "$WEIGHT_DECAY" \
   --device "$DEVICE" \
   --dtype "$DTYPE" \
-  --seed "$SEED"
+  --seed "$SEED" \
+  --num-threads "$NUM_THREADS"
