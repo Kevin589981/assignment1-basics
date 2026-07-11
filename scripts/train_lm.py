@@ -6,7 +6,9 @@ import math
 import os
 import sys
 import time
+import traceback
 from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -22,8 +24,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a decoder-only Transformer language model.")
     parser.add_argument("--train-data", required=True, help="Path to a 1D .npy array of token IDs.")
     parser.add_argument("--val-data", required=True, help="Path to a 1D .npy array of token IDs.")
-    parser.add_argument("--out-dir", default="runs/debug", help="Directory for logs and checkpoints.")
+    parser.add_argument("--out-dir", default=None, help="Exact directory for logs and checkpoints.")
+    parser.add_argument("--run-root", default="runs", help="Parent directory used when --out-dir is omitted.")
+    parser.add_argument("--experiment-name", default=None, help="Human-readable experiment name.")
+    parser.add_argument("--no-auto-name", action="store_true", help="Disable timestamp/config suffix for auto out-dir.")
+    parser.add_argument("--overwrite", action="store_true", help="Allow writing into a non-empty fresh run directory.")
     parser.add_argument("--resume", default=None, help="Checkpoint path to resume from.")
+    parser.add_argument("--save-best", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--save-interrupted", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--vocab-size", type=int, required=True)
     parser.add_argument("--context-length", type=int, default=256)
@@ -63,6 +71,43 @@ def load_tokens(path: str | os.PathLike) -> np.ndarray:
 def write_jsonl(path: Path, record: dict) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+
+def slugify(text: str) -> str:
+    chars = []
+    for char in text.lower():
+        if char.isalnum():
+            chars.append(char)
+        elif char in {"-", "_", "."}:
+            chars.append(char)
+        else:
+            chars.append("-")
+    slug = "".join(chars).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug or "run"
+
+
+def resolve_out_dir(args: argparse.Namespace) -> Path:
+    if args.out_dir is not None:
+        return Path(args.out_dir)
+    name = args.experiment_name or "lm"
+    if not args.no_auto_name:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = (
+            f"{stamp}-{name}-vs{args.vocab_size}-ctx{args.context_length}-"
+            f"dm{args.d_model}-l{args.num_layers}-h{args.num_heads}-bs{args.batch_size}-lr{args.max_lr:g}"
+        )
+    return Path(args.run_root) / slugify(name)
+
+
+def write_json(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def append_event(run_dir: Path, event: str, **fields) -> None:
+    record = {"time": datetime.now().isoformat(timespec="seconds"), "event": event, **fields}
+    write_jsonl(run_dir / "events.jsonl", record)
 
 
 def make_amp_context(use_amp: bool):
@@ -105,11 +150,16 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    out_dir = Path(args.out_dir)
+    out_dir = resolve_out_dir(args)
+    if out_dir.exists() and any(out_dir.iterdir()) and args.resume is None and not args.overwrite:
+        raise FileExistsError(f"{out_dir} is not empty; pass --overwrite or choose another run directory")
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "train_log.jsonl"
     config_path = out_dir / "config.json"
-    config_path.write_text(json.dumps(vars(args), indent=2, sort_keys=True), encoding="utf-8")
+    args_dict = vars(args).copy()
+    args_dict["resolved_out_dir"] = str(out_dir)
+    write_json(config_path, args_dict)
+    append_event(out_dir, "run_started", out_dir=str(out_dir))
 
     train_data = load_tokens(args.train_data)
     val_data = load_tokens(args.val_data)
@@ -134,68 +184,138 @@ def main() -> None:
     )
 
     start_step = 0
+    best_val_loss = math.inf
+    best_step = None
     if args.resume is not None:
         start_step = load_checkpoint(args.resume, model, optimizer)
         move_optimizer_state_to_device(optimizer, args.device)
+        summary_path = out_dir / "run_summary.json"
+        if summary_path.exists():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            best_val_loss = float(summary.get("best_val_loss", best_val_loss))
+            best_step = summary.get("best_step", best_step)
+        append_event(out_dir, "resumed", checkpoint=args.resume, start_step=start_step)
 
     use_amp = args.device.startswith("cuda") and args.dtype == "bfloat16"
     start_time = time.time()
     model.train()
 
-    for step in range(start_step, args.steps):
-        lr = lr_cosine_schedule(step, args.max_lr, args.min_lr, args.warmup_iters, args.steps)
-        for group in optimizer.param_groups:
-            group["lr"] = lr
+    iteration = start_step
+    last_train_loss = None
+    status = "running"
+    write_json(out_dir / "status.json", {"status": status, "step": iteration})
+    try:
+        for step in range(start_step, args.steps):
+            lr = lr_cosine_schedule(step, args.max_lr, args.min_lr, args.warmup_iters, args.steps)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
 
-        x, y = get_batch(train_data, args.batch_size, args.context_length, args.device)
-        optimizer.zero_grad(set_to_none=True)
-        with make_amp_context(use_amp):
-            logits = model(x)
-            loss = cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1))
-        loss.backward()
-        gradient_clipping(model.parameters(), args.max_grad_norm)
-        optimizer.step()
+            x, y = get_batch(train_data, args.batch_size, args.context_length, args.device)
+            optimizer.zero_grad(set_to_none=True)
+            with make_amp_context(use_amp):
+                logits = model(x)
+                loss = cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1))
+            loss.backward()
+            gradient_clipping(model.parameters(), args.max_grad_norm)
+            optimizer.step()
 
-        iteration = step + 1
-        if iteration % args.log_interval == 0 or iteration == 1:
-            elapsed = time.time() - start_time
-            record = {
-                "step": iteration,
-                "split": "train",
-                "loss": loss.item(),
-                "ppl": math.exp(min(loss.item(), 20.0)),
-                "lr": lr,
-                "elapsed_sec": elapsed,
-                "tokens": iteration * args.batch_size * args.context_length,
-            }
-            write_jsonl(log_path, record)
-            print(json.dumps(record, ensure_ascii=True), flush=True)
+            iteration = step + 1
+            last_train_loss = loss.item()
+            tokens = iteration * args.batch_size * args.context_length
+            if iteration % args.log_interval == 0 or iteration == 1:
+                elapsed = time.time() - start_time
+                record = {
+                    "step": iteration,
+                    "split": "train",
+                    "loss": last_train_loss,
+                    "ppl": math.exp(min(last_train_loss, 20.0)),
+                    "lr": lr,
+                    "elapsed_sec": elapsed,
+                    "tokens": tokens,
+                    "tokens_per_sec": tokens / elapsed if elapsed > 0 else None,
+                }
+                write_jsonl(log_path, record)
+                print(json.dumps(record, ensure_ascii=True), flush=True)
 
-        if iteration % args.eval_interval == 0 or iteration == args.steps:
-            val_loss = estimate_loss(
-                model,
-                val_data,
-                args.batch_size,
-                args.context_length,
-                args.device,
-                args.eval_iters,
-                use_amp,
+            if iteration % args.eval_interval == 0 or iteration == args.steps:
+                val_loss = estimate_loss(
+                    model,
+                    val_data,
+                    args.batch_size,
+                    args.context_length,
+                    args.device,
+                    args.eval_iters,
+                    use_amp,
+                )
+                is_best = val_loss < best_val_loss
+                if is_best:
+                    best_val_loss = val_loss
+                    best_step = iteration
+                    if args.save_best:
+                        save_checkpoint(model, optimizer, iteration, out_dir / "ckpt_best.pt")
+                        append_event(out_dir, "best_checkpoint", step=iteration, val_loss=val_loss)
+                record = {
+                    "step": iteration,
+                    "split": "val",
+                    "loss": val_loss,
+                    "ppl": math.exp(min(val_loss, 20.0)),
+                    "lr": lr,
+                    "elapsed_sec": time.time() - start_time,
+                    "tokens": tokens,
+                    "best_val_loss": best_val_loss,
+                    "best_step": best_step,
+                    "is_best": is_best,
+                }
+                write_jsonl(log_path, record)
+                print(json.dumps(record, ensure_ascii=True), flush=True)
+
+            if iteration % args.checkpoint_interval == 0 or iteration == args.steps:
+                save_checkpoint(model, optimizer, iteration, out_dir / f"ckpt_{iteration:06d}.pt")
+                save_checkpoint(model, optimizer, iteration, out_dir / "ckpt_latest.pt")
+                append_event(out_dir, "checkpoint", step=iteration)
+
+            write_json(
+                out_dir / "run_summary.json",
+                {
+                    "status": "running",
+                    "step": iteration,
+                    "tokens": tokens,
+                    "last_train_loss": last_train_loss,
+                    "best_val_loss": best_val_loss if math.isfinite(best_val_loss) else None,
+                    "best_step": best_step,
+                    "elapsed_sec": time.time() - start_time,
+                    "out_dir": str(out_dir),
+                },
             )
-            record = {
-                "step": iteration,
-                "split": "val",
-                "loss": val_loss,
-                "ppl": math.exp(min(val_loss, 20.0)),
-                "lr": lr,
-                "elapsed_sec": time.time() - start_time,
-                "tokens": iteration * args.batch_size * args.context_length,
-            }
-            write_jsonl(log_path, record)
-            print(json.dumps(record, ensure_ascii=True), flush=True)
-
-        if iteration % args.checkpoint_interval == 0 or iteration == args.steps:
-            save_checkpoint(model, optimizer, iteration, out_dir / f"ckpt_{iteration:06d}.pt")
-            save_checkpoint(model, optimizer, iteration, out_dir / "ckpt_latest.pt")
+            write_json(out_dir / "status.json", {"status": "running", "step": iteration})
+        status = "completed"
+        append_event(out_dir, "run_completed", step=iteration)
+    except KeyboardInterrupt:
+        status = "interrupted"
+        if args.save_interrupted:
+            save_checkpoint(model, optimizer, iteration, out_dir / "ckpt_interrupted.pt")
+        append_event(out_dir, "run_interrupted", step=iteration)
+        raise
+    except Exception as exc:
+        status = "failed"
+        if args.save_interrupted:
+            save_checkpoint(model, optimizer, iteration, out_dir / "ckpt_failed.pt")
+        (out_dir / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        append_event(out_dir, "run_failed", step=iteration, error=repr(exc))
+        raise
+    finally:
+        summary = {
+            "status": status,
+            "step": iteration,
+            "tokens": iteration * args.batch_size * args.context_length,
+            "last_train_loss": last_train_loss,
+            "best_val_loss": best_val_loss if math.isfinite(best_val_loss) else None,
+            "best_step": best_step,
+            "elapsed_sec": time.time() - start_time,
+            "out_dir": str(out_dir),
+        }
+        write_json(out_dir / "run_summary.json", summary)
+        write_json(out_dir / "status.json", {"status": status, "step": iteration})
 
 
 if __name__ == "__main__":
