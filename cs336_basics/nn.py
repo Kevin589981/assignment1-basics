@@ -7,6 +7,10 @@ from torch import Tensor
 from torch import nn
 
 
+def _init_weight(weight: Tensor, std: float = 0.02) -> None:
+    nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
+
+
 def linear(x: Tensor, weight: Tensor) -> Tensor:
     return x @ weight.transpose(-1, -2)
 
@@ -142,6 +146,123 @@ def transformer_lm(
         x = transformer_block(x, block_weights, num_heads, d_ff, context_length, rope_theta)
     x = rmsnorm(x, weights["ln_final.weight"])
     return linear(x, weights["lm_head.weight"])
+
+
+class Linear(nn.Module):
+    def __init__(self, d_in: int, d_out: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(d_out, d_in))
+        _init_weight(self.weight)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return linear(x, self.weight)
+
+
+class Embedding(nn.Module):
+    def __init__(self, vocab_size: int, d_model: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(vocab_size, d_model))
+        _init_weight(self.weight)
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        return embedding(token_ids, self.weight)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        return rmsnorm(x, self.weight, self.eps)
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model: int, d_ff: int):
+        super().__init__()
+        self.w1 = Linear(d_model, d_ff)
+        self.w2 = Linear(d_ff, d_model)
+        self.w3 = Linear(d_model, d_ff)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return swiglu(x, self.w1.weight, self.w2.weight, self.w3.weight)
+
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float):
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.max_seq_len = max_seq_len
+        self.theta = theta
+        self.q_proj = Linear(d_model, d_model)
+        self.k_proj = Linear(d_model, d_model)
+        self.v_proj = Linear(d_model, d_model)
+        self.output_proj = Linear(d_model, d_model)
+
+    def forward(self, x: Tensor, token_positions: Tensor | None = None) -> Tensor:
+        return multihead_self_attention(
+            x,
+            self.num_heads,
+            self.q_proj.weight,
+            self.k_proj.weight,
+            self.v_proj.weight,
+            self.output_proj.weight,
+            max_seq_len=self.max_seq_len,
+            theta=self.theta,
+            token_positions=token_positions,
+        )
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float):
+        super().__init__()
+        self.attn = MultiHeadSelfAttention(d_model, num_heads, max_seq_len, theta)
+        self.ln1 = RMSNorm(d_model)
+        self.ffn = SwiGLU(d_model, d_ff)
+        self.ln2 = RMSNorm(d_model)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.attn(self.ln1(x))
+        return x + self.ffn(self.ln2(x))
+
+
+class TransformerLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
+        self.token_embeddings = Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList(
+            [TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta) for _ in range(num_layers)]
+        )
+        self.ln_final = RMSNorm(d_model)
+        self.lm_head = Linear(d_model, vocab_size)
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        if token_ids.shape[-1] > self.context_length:
+            raise ValueError("input sequence length exceeds context_length")
+        x = self.token_embeddings(token_ids)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.ln_final(x)
+        return self.lm_head(x)
 
 
 def gradient_clipping(parameters, max_l2_norm: float) -> None:
