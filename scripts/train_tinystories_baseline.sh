@@ -32,6 +32,7 @@ WARMUP_ITERS="${WARMUP_ITERS:-1000}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 SEED="${SEED:-42}"
 NUM_THREADS="${NUM_THREADS:-40}"
+PEAK_FLOPS="${PEAK_FLOPS:-989e12}"
 
 ARGS=(
   scripts/train_lm.py
@@ -60,6 +61,7 @@ ARGS=(
   --dtype "$DTYPE"
   --seed "$SEED"
   --num-threads "$NUM_THREADS"
+  --peak-flops "$PEAK_FLOPS"
 )
 
 if [[ -n "$RUN_DIR" ]]; then

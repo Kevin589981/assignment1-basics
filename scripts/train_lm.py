@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cs336_basics.data import get_batch, load_checkpoint, save_checkpoint
 from cs336_basics.nn import AdamW, TransformerLM, cross_entropy, gradient_clipping, lr_cosine_schedule
+from scripts.plot_training_curves import plot_curves
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,6 +62,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-threads", type=int, default=None)
+    parser.add_argument(
+        "--peak-flops",
+        type=float,
+        default=float(os.environ.get("PEAK_FLOPS", 989e12)),
+        help="Hardware peak FLOP/s used for MFU. Default is H100 BF16 dense peak, 989e12.",
+    )
     return parser.parse_args()
 
 
@@ -110,6 +117,16 @@ def append_event(run_dir: Path, event: str, **fields) -> None:
     write_jsonl(run_dir / "events.jsonl", record)
 
 
+def try_plot_curves(run_dir: Path) -> None:
+    try:
+        plot_path = plot_curves(run_dir)
+    except Exception as exc:
+        append_event(run_dir, "plot_failed", error=repr(exc))
+        return
+    if plot_path is not None:
+        append_event(run_dir, "plot_written", path=str(plot_path))
+
+
 def make_amp_context(use_amp: bool):
     return torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
 
@@ -119,6 +136,17 @@ def move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: str
         for key, value in state.items():
             if torch.is_tensor(value):
                 state[key] = value.to(device)
+
+
+def estimate_training_flops_per_token(model: torch.nn.Module, num_layers: int, d_model: int, context_length: int) -> int:
+    n_params = sum(parameter.numel() for parameter in model.parameters())
+    return 6 * n_params + 12 * num_layers * d_model * context_length
+
+
+def calculate_mfu(tokens_per_sec: float | None, flops_per_token: int, peak_flops: float) -> float | None:
+    if tokens_per_sec is None or peak_flops <= 0:
+        return None
+    return tokens_per_sec * flops_per_token / peak_flops
 
 
 @torch.no_grad()
@@ -182,6 +210,15 @@ def main() -> None:
         eps=args.eps,
         weight_decay=args.weight_decay,
     )
+    flops_per_token = estimate_training_flops_per_token(model, args.num_layers, args.d_model, args.context_length)
+    model_params = sum(parameter.numel() for parameter in model.parameters())
+    append_event(
+        out_dir,
+        "model_profile",
+        model_params=model_params,
+        flops_per_token=flops_per_token,
+        peak_flops=args.peak_flops,
+    )
 
     start_step = 0
     best_val_loss = math.inf
@@ -224,6 +261,8 @@ def main() -> None:
             tokens = iteration * args.batch_size * args.context_length
             if iteration % args.log_interval == 0 or iteration == 1:
                 elapsed = time.time() - start_time
+                tokens_per_sec = tokens / elapsed if elapsed > 0 else None
+                mfu = calculate_mfu(tokens_per_sec, flops_per_token, args.peak_flops)
                 record = {
                     "step": iteration,
                     "split": "train",
@@ -232,7 +271,9 @@ def main() -> None:
                     "lr": lr,
                     "elapsed_sec": elapsed,
                     "tokens": tokens,
-                    "tokens_per_sec": tokens / elapsed if elapsed > 0 else None,
+                    "tokens_per_sec": tokens_per_sec,
+                    "mfu": mfu,
+                    "mfu_percent": mfu * 100 if mfu is not None else None,
                 }
                 write_jsonl(log_path, record)
                 print(json.dumps(record, ensure_ascii=True), flush=True)
@@ -316,6 +357,7 @@ def main() -> None:
         }
         write_json(out_dir / "run_summary.json", summary)
         write_json(out_dir / "status.json", {"status": status, "step": iteration})
+        try_plot_curves(out_dir)
 
 
 if __name__ == "__main__":
