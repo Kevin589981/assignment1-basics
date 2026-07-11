@@ -4,12 +4,15 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cs336_basics.data import get_batch, load_checkpoint, save_checkpoint
 from cs336_basics.nn import AdamW, TransformerLM, cross_entropy, gradient_clipping, lr_cosine_schedule

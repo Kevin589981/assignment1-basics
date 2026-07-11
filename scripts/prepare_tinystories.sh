@@ -2,6 +2,10 @@
 set -euo pipefail
 
 PYTHON="${PYTHON:-.venv-cu128/bin/python}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
 if [[ ! -x "$PYTHON" ]]; then
   PYTHON="${PYTHON_FALLBACK:-python}"
 fi

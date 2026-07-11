@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cs336_basics.nn import TransformerLM, softmax
 from cs336_basics.tokenizer import Tokenizer

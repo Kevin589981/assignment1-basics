@@ -3,6 +3,8 @@ set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-data}"
 DOWNLOAD_OWT="${DOWNLOAD_OWT:-0}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 
 mkdir -p "$DATA_DIR"
 cd "$DATA_DIR"
