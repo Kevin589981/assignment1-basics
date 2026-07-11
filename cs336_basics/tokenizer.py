@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 import os
 
@@ -91,6 +91,30 @@ def _word_pair_counts(word_counts: Counter[tuple[bytes, ...]]) -> Counter[tuple[
     return counts
 
 
+def _build_pair_index(
+    word_counts: Counter[tuple[bytes, ...]],
+) -> tuple[Counter[tuple[bytes, bytes]], dict[tuple[bytes, bytes], set[tuple[bytes, ...]]]]:
+    pair_counts: Counter[tuple[bytes, bytes]] = Counter()
+    pair_to_words: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = defaultdict(set)
+    for word, count in word_counts.items():
+        for pair in zip(word, word[1:]):
+            pair_counts[pair] += count
+            pair_to_words[pair].add(word)
+    return pair_counts, pair_to_words
+
+
+def _decrement_pair_count(
+    pair_counts: Counter[tuple[bytes, bytes]],
+    pair: tuple[bytes, bytes],
+    amount: int,
+) -> None:
+    next_count = pair_counts[pair] - amount
+    if next_count > 0:
+        pair_counts[pair] = next_count
+    else:
+        pair_counts.pop(pair, None)
+
+
 def _merge_word(word: tuple[bytes, ...], pair: tuple[bytes, bytes]) -> tuple[bytes, ...]:
     merged: list[bytes] = []
     i = 0
@@ -123,16 +147,35 @@ def train_bpe(
         for pretoken in _pretokenize(segment):
             word_counts[tuple(bytes([b]) for b in pretoken)] += 1
 
+    pair_counts, pair_to_words = _build_pair_index(word_counts)
     merges: list[tuple[bytes, bytes]] = []
     while len(vocab) < vocab_size:
-        pair_counts = _word_pair_counts(word_counts)
         if not pair_counts:
             break
         best_pair = max(pair_counts, key=lambda pair: (pair_counts[pair], pair))
         merges.append(best_pair)
         vocab[len(vocab)] = best_pair[0] + best_pair[1]
-        next_counts: Counter[tuple[bytes, ...]] = Counter()
-        for word, count in word_counts.items():
-            next_counts[_merge_word(word, best_pair)] += count
-        word_counts = next_counts
+        affected_words = list(pair_to_words.pop(best_pair, set()))
+        for word in affected_words:
+            count = word_counts.pop(word, 0)
+            if count == 0:
+                continue
+            new_word = _merge_word(word, best_pair)
+            if new_word == word:
+                word_counts[word] += count
+                continue
+
+            for old_pair in zip(word, word[1:]):
+                _decrement_pair_count(pair_counts, old_pair, count)
+                if old_pair != best_pair:
+                    words = pair_to_words.get(old_pair)
+                    if words is not None:
+                        words.discard(word)
+                        if not words:
+                            pair_to_words.pop(old_pair, None)
+
+            word_counts[new_word] += count
+            for new_pair in zip(new_word, new_word[1:]):
+                pair_counts[new_pair] += count
+                pair_to_words[new_pair].add(new_word)
     return vocab, merges
