@@ -41,6 +41,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--num-heads", type=int, default=16)
     parser.add_argument("--rope-theta", type=float, default=10000.0)
+    parser.add_argument("--norm-type", choices=["rmsnorm", "none"], default="rmsnorm")
+    parser.add_argument("--norm-position", choices=["pre", "post"], default="pre")
+    parser.add_argument("--pos-emb", choices=["rope", "none"], default="rope")
+    parser.add_argument("--ffn-type", choices=["swiglu", "silu"], default="swiglu")
 
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--steps", type=int, default=10000)
@@ -101,9 +105,22 @@ def resolve_out_dir(args: argparse.Namespace) -> Path:
     name = args.experiment_name or "lm"
     if not args.no_auto_name:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        variant = []
+        if args.d_ff != 1344:
+            variant.append(f"dff{args.d_ff}")
+        if args.norm_type != "rmsnorm":
+            variant.append(f"norm{args.norm_type}")
+        if args.norm_position != "pre":
+            variant.append(f"normpos{args.norm_position}")
+        if args.pos_emb != "rope":
+            variant.append(f"posemb{args.pos_emb}")
+        if args.ffn_type != "swiglu":
+            variant.append(f"ffn{args.ffn_type}")
+        variant_suffix = "-" + "-".join(variant) if variant else ""
         name = (
             f"{stamp}-{name}-vs{args.vocab_size}-ctx{args.context_length}-"
             f"dm{args.d_model}-l{args.num_layers}-h{args.num_heads}-bs{args.batch_size}-lr{args.max_lr:g}"
+            f"{variant_suffix}"
         )
     return Path(args.run_root) / slugify(name)
 
@@ -202,6 +219,10 @@ def main() -> None:
         num_heads=args.num_heads,
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
+        norm_type=args.norm_type,
+        norm_position=args.norm_position,
+        pos_emb=args.pos_emb,
+        ffn_type=args.ffn_type,
     ).to(args.device)
     optimizer = AdamW(
         model.parameters(),

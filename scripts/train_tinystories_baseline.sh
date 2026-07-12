@@ -21,6 +21,7 @@ DEVICE="${DEVICE:-cuda}"
 DTYPE="${DTYPE:-bfloat16}"
 
 BATCH_SIZE="${BATCH_SIZE:-128}"
+D_FF="${D_FF:-1344}"
 STEPS="${STEPS:-10000}"
 EVAL_ITERS="${EVAL_ITERS:-100}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-500}"
@@ -33,6 +34,10 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 SEED="${SEED:-42}"
 NUM_THREADS="${NUM_THREADS:-40}"
 PEAK_FLOPS="${PEAK_FLOPS:-989e12}"
+NORM_TYPE="${NORM_TYPE:-rmsnorm}"
+NORM_POSITION="${NORM_POSITION:-pre}"
+POS_EMB="${POS_EMB:-rope}"
+FFN_TYPE="${FFN_TYPE:-swiglu}"
 
 ARGS=(
   scripts/train_lm.py
@@ -43,10 +48,14 @@ ARGS=(
   --vocab-size 10000
   --context-length 256
   --d-model 512
-  --d-ff 1344
+  --d-ff "$D_FF"
   --num-layers 4
   --num-heads 16
   --rope-theta 10000
+  --norm-type "$NORM_TYPE"
+  --norm-position "$NORM_POSITION"
+  --pos-emb "$POS_EMB"
+  --ffn-type "$FFN_TYPE"
   --batch-size "$BATCH_SIZE"
   --steps "$STEPS"
   --eval-iters "$EVAL_ITERS"

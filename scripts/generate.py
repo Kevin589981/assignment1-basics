@@ -62,6 +62,10 @@ def build_model(config: dict, device: str) -> TransformerLM:
         num_heads=int(config["num_heads"]),
         d_ff=int(config["d_ff"]),
         rope_theta=float(config["rope_theta"]),
+        norm_type=config.get("norm_type", "rmsnorm"),
+        norm_position=config.get("norm_position", "pre"),
+        pos_emb=config.get("pos_emb", "rope"),
+        ffn_type=config.get("ffn_type", "swiglu"),
     )
     return model.to(device)
 

@@ -178,6 +178,11 @@ class RMSNorm(nn.Module):
         return rmsnorm(x, self.weight, self.eps)
 
 
+class IdentityNorm(nn.Module):
+    def forward(self, x: Tensor) -> Tensor:
+        return x
+
+
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_ff: int):
         super().__init__()
@@ -189,8 +194,18 @@ class SwiGLU(nn.Module):
         return swiglu(x, self.w1.weight, self.w2.weight, self.w3.weight)
 
 
+class SiLUFFN(nn.Module):
+    def __init__(self, d_model: int, d_ff: int):
+        super().__init__()
+        self.w1 = Linear(d_model, d_ff)
+        self.w2 = Linear(d_ff, d_model)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return linear(silu(linear(x, self.w1.weight)), self.w2.weight)
+
+
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float):
+    def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float | None):
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
@@ -217,16 +232,37 @@ class MultiHeadSelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        max_seq_len: int,
+        theta: float | None,
+        norm_type: str = "rmsnorm",
+        norm_position: str = "pre",
+        ffn_type: str = "swiglu",
+    ):
         super().__init__()
+        if norm_type not in {"rmsnorm", "none"}:
+            raise ValueError("norm_type must be 'rmsnorm' or 'none'")
+        if norm_position not in {"pre", "post"}:
+            raise ValueError("norm_position must be 'pre' or 'post'")
+        if ffn_type not in {"swiglu", "silu"}:
+            raise ValueError("ffn_type must be 'swiglu' or 'silu'")
+        norm_cls = RMSNorm if norm_type == "rmsnorm" else IdentityNorm
         self.attn = MultiHeadSelfAttention(d_model, num_heads, max_seq_len, theta)
-        self.ln1 = RMSNorm(d_model)
-        self.ffn = SwiGLU(d_model, d_ff)
-        self.ln2 = RMSNorm(d_model)
+        self.ln1 = norm_cls(d_model) if norm_type == "rmsnorm" else norm_cls()
+        self.ffn = SwiGLU(d_model, d_ff) if ffn_type == "swiglu" else SiLUFFN(d_model, d_ff)
+        self.ln2 = norm_cls(d_model) if norm_type == "rmsnorm" else norm_cls()
+        self.norm_position = norm_position
 
     def forward(self, x: Tensor) -> Tensor:
-        x = x + self.attn(self.ln1(x))
-        return x + self.ffn(self.ln2(x))
+        if self.norm_position == "pre":
+            x = x + self.attn(self.ln1(x))
+            return x + self.ffn(self.ln2(x))
+        x = self.ln1(x + self.attn(x))
+        return self.ln2(x + self.ffn(x))
 
 
 class TransformerLM(nn.Module):
@@ -239,8 +275,20 @@ class TransformerLM(nn.Module):
         num_heads: int,
         d_ff: int,
         rope_theta: float,
+        norm_type: str = "rmsnorm",
+        norm_position: str = "pre",
+        pos_emb: str = "rope",
+        ffn_type: str = "swiglu",
     ):
         super().__init__()
+        if norm_type not in {"rmsnorm", "none"}:
+            raise ValueError("norm_type must be 'rmsnorm' or 'none'")
+        if norm_position not in {"pre", "post"}:
+            raise ValueError("norm_position must be 'pre' or 'post'")
+        if pos_emb not in {"rope", "none"}:
+            raise ValueError("pos_emb must be 'rope' or 'none'")
+        if ffn_type not in {"swiglu", "silu"}:
+            raise ValueError("ffn_type must be 'swiglu' or 'silu'")
         self.vocab_size = vocab_size
         self.context_length = context_length
         self.d_model = d_model
@@ -248,11 +296,28 @@ class TransformerLM(nn.Module):
         self.num_heads = num_heads
         self.d_ff = d_ff
         self.rope_theta = rope_theta
+        self.norm_type = norm_type
+        self.norm_position = norm_position
+        self.pos_emb = pos_emb
+        self.ffn_type = ffn_type
         self.token_embeddings = Embedding(vocab_size, d_model)
+        theta = rope_theta if pos_emb == "rope" else None
         self.layers = nn.ModuleList(
-            [TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta) for _ in range(num_layers)]
+            [
+                TransformerBlock(
+                    d_model,
+                    num_heads,
+                    d_ff,
+                    context_length,
+                    theta,
+                    norm_type=norm_type,
+                    norm_position=norm_position,
+                    ffn_type=ffn_type,
+                )
+                for _ in range(num_layers)
+            ]
         )
-        self.ln_final = RMSNorm(d_model)
+        self.ln_final = RMSNorm(d_model) if norm_type == "rmsnorm" and norm_position == "pre" else IdentityNorm()
         self.lm_head = Linear(d_model, vocab_size)
 
     def forward(self, token_ids: Tensor) -> Tensor:
