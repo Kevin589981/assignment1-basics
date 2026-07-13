@@ -1,7 +1,8 @@
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -27,6 +28,8 @@ struct MergeUpdate {
     old_pairs: Vec<Pair>,
     new_pairs: Vec<Pair>,
 }
+
+const PARALLEL_AFFECTED_THRESHOLD: usize = 2048;
 
 impl Ord for PairCount {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -239,8 +242,8 @@ fn build_indexes(
         .fold(
             || {
                 (
-                    HashMap::<Pair, u64>::new(),
-                    HashMap::<Pair, HashSet<usize>>::new(),
+                    HashMap::<Pair, u64>::default(),
+                    HashMap::<Pair, HashSet<usize>>::default(),
                 )
             },
             |(mut pair_counts, mut pair_to_words), word_id| {
@@ -256,8 +259,8 @@ fn build_indexes(
         .reduce(
             || {
                 (
-                    HashMap::<Pair, u64>::new(),
-                    HashMap::<Pair, HashSet<usize>>::new(),
+                    HashMap::<Pair, u64>::default(),
+                    HashMap::<Pair, HashSet<usize>>::default(),
                 )
             },
             |(mut left_counts, mut left_words), (right_counts, right_words)| {
@@ -509,13 +512,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pretoken_counts: HashMap<Vec<u8>, u64> = segments
         .par_chunks(chunk_size)
         .map(|chunk| {
-            let mut counts = HashMap::new();
+            let mut counts = HashMap::default();
             for segment in chunk {
                 pretokenize_segment(segment, &mut counts);
             }
             counts
         })
-        .reduce(HashMap::new, merge_pretoken_counts);
+        .reduce(HashMap::default, merge_pretoken_counts);
     eprintln!(
         "pretokenized unique_words={} segments={} chunk_size={} workers={} elapsed={:.1}s",
         pretoken_counts.len(),
@@ -546,7 +549,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut words: Vec<Vec<u32>> = Vec::with_capacity(pretoken_counts.len());
     let mut word_counts: Vec<u64> = Vec::with_capacity(pretoken_counts.len());
     let mut active: Vec<bool> = Vec::with_capacity(pretoken_counts.len());
-    let mut word_to_id: HashMap<Vec<u32>, usize> = HashMap::with_capacity(pretoken_counts.len());
+    let mut word_to_id: HashMap<Vec<u32>, usize> =
+        HashMap::with_capacity_and_hasher(pretoken_counts.len(), Default::default());
     for (bytes, count) in pretoken_counts {
         let word: Vec<u32> = bytes.into_iter().map(u32::from).collect();
         let id = words.len();
@@ -603,14 +607,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let heap_before_update = pair_heap.len();
         let affected_count = affected_with_counts.len();
-        let mut old_pair_deltas: HashMap<Pair, u64> = HashMap::new();
-        let mut new_pair_deltas: HashMap<Pair, u64> = HashMap::new();
-        let updates: Vec<MergeUpdate> = affected_with_counts
-            .into_par_iter()
-            .map(|(word_id, count, old_word)| {
-                merge_update(word_id, old_word, count, pair, new_token)
-            })
-            .collect();
+        let mut old_pair_deltas: HashMap<Pair, u64> = HashMap::default();
+        let mut new_pair_deltas: HashMap<Pair, u64> = HashMap::default();
+        let updates: Vec<MergeUpdate> = if affected_count >= PARALLEL_AFFECTED_THRESHOLD {
+            affected_with_counts
+                .into_par_iter()
+                .map(|(word_id, count, old_word)| {
+                    merge_update(word_id, old_word, count, pair, new_token)
+                })
+                .collect()
+        } else {
+            affected_with_counts
+                .into_iter()
+                .map(|(word_id, count, old_word)| {
+                    merge_update(word_id, old_word, count, pair, new_token)
+                })
+                .collect()
+        };
 
         for update in &updates {
             active[update.old_id] = false;

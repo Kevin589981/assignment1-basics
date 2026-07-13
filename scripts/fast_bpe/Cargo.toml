@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 rayon = "1.10"
+rustc-hash = "2.1"
 
 [profile.release]
 codegen-units = 1
