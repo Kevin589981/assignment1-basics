@@ -7,31 +7,33 @@ use std::fs;
 use std::io::{self, Write};
 use std::time::Instant;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct Pair(Vec<u8>, Vec<u8>);
-
-type Word = Vec<Vec<u8>>;
-
-#[derive(Debug)]
-struct MergeUpdate {
-    old_word: Word,
-    new_word: Word,
-    count: u64,
-    old_pairs: Vec<Pair>,
-    new_pairs: Vec<Pair>,
-}
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct Pair(u32, u32);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PairCount {
     count: u64,
     pair: Pair,
+    left: Vec<u8>,
+    right: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct MergeUpdate {
+    old_id: usize,
+    old_word: Vec<u32>,
+    new_word: Vec<u32>,
+    count: u64,
+    old_pairs: Vec<Pair>,
+    new_pairs: Vec<Pair>,
 }
 
 impl Ord for PairCount {
     fn cmp(&self, other: &Self) -> Ordering {
         self.count
             .cmp(&other.count)
-            .then_with(|| cmp_pair(&self.pair, &other.pair))
+            .then_with(|| self.left.cmp(&other.left))
+            .then_with(|| self.right.cmp(&other.right))
     }
 }
 
@@ -105,7 +107,7 @@ fn consume_whitespace_like_gpt2(text: &str, start: usize) -> (usize, usize) {
     }
 }
 
-fn pretokenize_segment(text: &str, counts: &mut HashMap<Word, u64>) {
+fn pretokenize_segment(text: &str, counts: &mut HashMap<Vec<u8>, u64>) {
     let mut idx = 0;
     while idx < text.len() {
         if let Some(width) = starts_with_contraction(text, idx) {
@@ -158,18 +160,16 @@ fn pretokenize_segment(text: &str, counts: &mut HashMap<Word, u64>) {
     }
 }
 
-fn add_pretoken(bytes: &[u8], counts: &mut HashMap<Word, u64>) {
-    if bytes.is_empty() {
-        return;
+fn add_pretoken(bytes: &[u8], counts: &mut HashMap<Vec<u8>, u64>) {
+    if !bytes.is_empty() {
+        *counts.entry(bytes.to_vec()).or_insert(0) += 1;
     }
-    let word: Word = bytes.iter().map(|b| vec![*b]).collect();
-    *counts.entry(word).or_insert(0) += 1;
 }
 
-fn merge_word_counts(
-    mut left: HashMap<Word, u64>,
-    right: HashMap<Word, u64>,
-) -> HashMap<Word, u64> {
+fn merge_pretoken_counts(
+    mut left: HashMap<Vec<u8>, u64>,
+    right: HashMap<Vec<u8>, u64>,
+) -> HashMap<Vec<u8>, u64> {
     for (word, count) in right {
         *left.entry(word).or_insert(0) += count;
     }
@@ -179,6 +179,12 @@ fn merge_word_counts(
 fn split_specials<'a>(text: &'a str, special_tokens: &[String]) -> Vec<&'a str> {
     if special_tokens.is_empty() {
         return vec![text];
+    }
+    if special_tokens.len() == 1 {
+        return text
+            .split(special_tokens[0].as_str())
+            .filter(|segment| !segment.is_empty())
+            .collect();
     }
     let mut segments = Vec::new();
     let mut idx = 0;
@@ -220,23 +226,29 @@ fn split_specials<'a>(text: &'a str, special_tokens: &[String]) -> Vec<&'a str> 
     segments
 }
 
+fn pairs_in_word(word: &[u32]) -> Vec<Pair> {
+    word.windows(2).map(|pair| Pair(pair[0], pair[1])).collect()
+}
+
 fn build_indexes(
-    word_counts: &HashMap<Word, u64>,
-) -> (HashMap<Pair, u64>, HashMap<Pair, HashSet<Word>>) {
-    word_counts
-        .par_iter()
+    words: &[Vec<u32>],
+    word_counts: &[u64],
+) -> (HashMap<Pair, u64>, HashMap<Pair, HashSet<usize>>) {
+    (0..words.len())
+        .into_par_iter()
         .fold(
             || {
                 (
                     HashMap::<Pair, u64>::new(),
-                    HashMap::<Pair, HashSet<Word>>::new(),
+                    HashMap::<Pair, HashSet<usize>>::new(),
                 )
             },
-            |(mut pair_counts, mut pair_to_words), (word, count)| {
-                for pair in word.windows(2) {
-                    let p = Pair(pair[0].clone(), pair[1].clone());
-                    *pair_counts.entry(p.clone()).or_insert(0) += *count;
-                    pair_to_words.entry(p).or_default().insert(word.clone());
+            |(mut pair_counts, mut pair_to_words), word_id| {
+                let count = word_counts[word_id];
+                for pair in words[word_id].windows(2) {
+                    let p = Pair(pair[0], pair[1]);
+                    *pair_counts.entry(p).or_insert(0) += count;
+                    pair_to_words.entry(p).or_default().insert(word_id);
                 }
                 (pair_counts, pair_to_words)
             },
@@ -245,7 +257,7 @@ fn build_indexes(
             || {
                 (
                     HashMap::<Pair, u64>::new(),
-                    HashMap::<Pair, HashSet<Word>>::new(),
+                    HashMap::<Pair, HashSet<usize>>::new(),
                 )
             },
             |(mut left_counts, mut left_words), (right_counts, right_words)| {
@@ -260,51 +272,38 @@ fn build_indexes(
         )
 }
 
-fn merge_word(word: &[Vec<u8>], pair: &Pair) -> Word {
-    let mut merged = Vec::with_capacity(word.len());
-    let mut i = 0;
-    while i < word.len() {
-        if i + 1 < word.len() && word[i] == pair.0 && word[i + 1] == pair.1 {
-            let mut token = word[i].clone();
-            token.extend_from_slice(&word[i + 1]);
-            merged.push(token);
-            i += 2;
-        } else {
-            merged.push(word[i].clone());
-            i += 1;
-        }
-    }
-    merged
-}
-
-fn build_pair_heap(pair_counts: &HashMap<Pair, u64>) -> BinaryHeap<PairCount> {
+fn build_pair_heap(pair_counts: &HashMap<Pair, u64>, vocab: &[Vec<u8>]) -> BinaryHeap<PairCount> {
     pair_counts
         .par_iter()
-        .map(|(pair, count)| PairCount {
-            count: *count,
-            pair: pair.clone(),
-        })
+        .map(|(pair, count)| make_pair_count(*pair, *count, vocab))
         .collect()
 }
 
-fn push_pair_count(heap: &mut BinaryHeap<PairCount>, pair: &Pair, count: u64) {
+fn make_pair_count(pair: Pair, count: u64, vocab: &[Vec<u8>]) -> PairCount {
+    PairCount {
+        count,
+        pair,
+        left: vocab[pair.0 as usize].clone(),
+        right: vocab[pair.1 as usize].clone(),
+    }
+}
+
+fn push_pair_count(heap: &mut BinaryHeap<PairCount>, pair: Pair, count: u64, vocab: &[Vec<u8>]) {
     if count > 0 {
-        heap.push(PairCount {
-            count,
-            pair: pair.clone(),
-        });
+        heap.push(make_pair_count(pair, count, vocab));
     }
 }
 
 fn dec_pair_count(
     pair_counts: &mut HashMap<Pair, u64>,
     heap: &mut BinaryHeap<PairCount>,
-    pair: &Pair,
+    pair: Pair,
     amount: u64,
+    vocab: &[Vec<u8>],
 ) {
     let mut next_count = None;
     let mut should_remove = false;
-    if let Some(value) = pair_counts.get_mut(pair) {
+    if let Some(value) = pair_counts.get_mut(&pair) {
         if *value > amount {
             *value -= amount;
             next_count = Some(*value);
@@ -313,9 +312,9 @@ fn dec_pair_count(
         }
     }
     if should_remove {
-        pair_counts.remove(pair);
+        pair_counts.remove(&pair);
     } else if let Some(count) = next_count {
-        push_pair_count(heap, pair, count);
+        push_pair_count(heap, pair, count, vocab);
     }
 }
 
@@ -324,10 +323,11 @@ fn inc_pair_count(
     heap: &mut BinaryHeap<PairCount>,
     pair: Pair,
     amount: u64,
+    vocab: &[Vec<u8>],
 ) {
-    let count = pair_counts.entry(pair.clone()).or_insert(0);
+    let count = pair_counts.entry(pair).or_insert(0);
     *count += amount;
-    push_pair_count(heap, &pair, *count);
+    push_pair_count(heap, pair, *count, vocab);
 }
 
 fn best_pair(heap: &mut BinaryHeap<PairCount>, pair_counts: &HashMap<Pair, u64>) -> Option<Pair> {
@@ -342,25 +342,34 @@ fn best_pair(heap: &mut BinaryHeap<PairCount>, pair_counts: &HashMap<Pair, u64>)
     None
 }
 
-fn cmp_pair(a: &Pair, b: &Pair) -> Ordering {
-    match a.0.cmp(&b.0) {
-        Ordering::Equal => a.1.cmp(&b.1),
-        order => order,
+fn merge_word(word: &[u32], pair: Pair, new_token: u32) -> Vec<u32> {
+    let mut merged = Vec::with_capacity(word.len());
+    let mut i = 0;
+    while i < word.len() {
+        if i + 1 < word.len() && word[i] == pair.0 && word[i + 1] == pair.1 {
+            merged.push(new_token);
+            i += 2;
+        } else {
+            merged.push(word[i]);
+            i += 1;
+        }
     }
+    merged
 }
 
-fn merge_update(word: Word, count: u64, pair: &Pair) -> MergeUpdate {
-    let old_pairs = word
-        .windows(2)
-        .map(|old| Pair(old[0].clone(), old[1].clone()))
-        .collect();
-    let new_word = merge_word(&word, pair);
-    let new_pairs = new_word
-        .windows(2)
-        .map(|new| Pair(new[0].clone(), new[1].clone()))
-        .collect();
+fn merge_update(
+    old_id: usize,
+    old_word: Vec<u32>,
+    count: u64,
+    pair: Pair,
+    new_token: u32,
+) -> MergeUpdate {
+    let old_pairs = pairs_in_word(&old_word);
+    let new_word = merge_word(&old_word, pair, new_token);
+    let new_pairs = pairs_in_word(&new_word);
     MergeUpdate {
-        old_word: word,
+        old_id,
+        old_word,
         new_word,
         count,
         old_pairs,
@@ -385,7 +394,7 @@ fn json_escape(text: &str) -> String {
 fn write_json(
     path: &str,
     vocab: &[Vec<u8>],
-    merges: &[Pair],
+    merges: &[(Vec<u8>, Vec<u8>)],
     special_tokens: &[String],
 ) -> io::Result<()> {
     let mut out = String::new();
@@ -495,31 +504,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     let segments = split_specials(&text, &special_tokens);
-    let mut word_counts: HashMap<Word, u64> = segments
-        .par_iter()
-        .map(|segment| {
+    let threads = rayon::current_num_threads();
+    let chunk_size = (segments.len() / (threads * 16)).max(1);
+    let pretoken_counts: HashMap<Vec<u8>, u64> = segments
+        .par_chunks(chunk_size)
+        .map(|chunk| {
             let mut counts = HashMap::new();
-            pretokenize_segment(segment, &mut counts);
+            for segment in chunk {
+                pretokenize_segment(segment, &mut counts);
+            }
             counts
         })
-        .reduce(HashMap::new, merge_word_counts);
+        .reduce(HashMap::new, merge_pretoken_counts);
     eprintln!(
-        "pretokenized unique_words={} segments={} workers={} elapsed={:.1}s",
-        word_counts.len(),
+        "pretokenized unique_words={} segments={} chunk_size={} workers={} elapsed={:.1}s",
+        pretoken_counts.len(),
         segments.len(),
-        rayon::current_num_threads(),
+        chunk_size,
+        threads,
         start.elapsed().as_secs_f64()
     );
+
     if let Some(path) = dump_pretokens {
-        let mut lines: Vec<String> = word_counts
+        let mut lines: Vec<String> = pretoken_counts
             .iter()
-            .map(|(word, count)| {
-                let mut bytes = Vec::new();
-                for token in word {
-                    bytes.extend_from_slice(token);
-                }
-                format!("{}\t{}", hex(&bytes), count)
-            })
+            .map(|(bytes, count)| format!("{}\t{}", hex(bytes), count))
             .collect();
         lines.sort();
         fs::write(path, lines.join("\n"))?;
@@ -533,9 +542,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let convert_start = Instant::now();
+    let mut words: Vec<Vec<u32>> = Vec::with_capacity(pretoken_counts.len());
+    let mut word_counts: Vec<u64> = Vec::with_capacity(pretoken_counts.len());
+    let mut active: Vec<bool> = Vec::with_capacity(pretoken_counts.len());
+    let mut word_to_id: HashMap<Vec<u32>, usize> = HashMap::with_capacity(pretoken_counts.len());
+    for (bytes, count) in pretoken_counts {
+        let word: Vec<u32> = bytes.into_iter().map(u32::from).collect();
+        let id = words.len();
+        words.push(word.clone());
+        word_counts.push(count);
+        active.push(true);
+        word_to_id.insert(word, id);
+    }
+    eprintln!(
+        "converted id_words={} elapsed={:.1}s total_elapsed={:.1}s",
+        words.len(),
+        convert_start.elapsed().as_secs_f64(),
+        start.elapsed().as_secs_f64()
+    );
+
     let index_start = Instant::now();
-    let (mut pair_counts, mut pair_to_words) = build_indexes(&word_counts);
-    let mut pair_heap = build_pair_heap(&pair_counts);
+    let (mut pair_counts, mut pair_to_words) = build_indexes(&words, &word_counts);
+    let mut pair_heap = build_pair_heap(&pair_counts, &vocab);
     eprintln!(
         "indexed pair_counts={} heap_entries={} workers={} elapsed={:.1}s total_elapsed={:.1}s",
         pair_counts.len(),
@@ -544,7 +573,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         index_start.elapsed().as_secs_f64(),
         start.elapsed().as_secs_f64()
     );
-    let mut merges: Vec<Pair> = Vec::new();
+
+    let mut merges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     while vocab.len() < vocab_size {
         let merge_start = Instant::now();
         let stale_before = pair_heap.len();
@@ -552,22 +582,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         };
         let stale_popped = stale_before.saturating_sub(pair_heap.len() + 1);
-        let mut merged_token = pair.0.clone();
-        merged_token.extend_from_slice(&pair.1);
+        let left_bytes = vocab[pair.0 as usize].clone();
+        let right_bytes = vocab[pair.1 as usize].clone();
+        let mut merged_token = left_bytes.clone();
+        merged_token.extend_from_slice(&right_bytes);
+        let new_token = vocab.len() as u32;
         vocab.push(merged_token);
-        merges.push(pair.clone());
+        merges.push((left_bytes, right_bytes));
 
-        let affected: Vec<Word> = pair_to_words
+        let affected: Vec<usize> = pair_to_words
             .remove(&pair)
             .unwrap_or_default()
             .into_iter()
+            .filter(|word_id| active[*word_id])
             .collect();
-        let mut affected_with_counts = Vec::with_capacity(affected.len());
-        for word in affected {
-            if let Some(count) = word_counts.remove(&word) {
-                affected_with_counts.push((word, count));
-            }
-        }
+        let affected_with_counts: Vec<(usize, u64, Vec<u32>)> = affected
+            .into_iter()
+            .map(|word_id| (word_id, word_counts[word_id], words[word_id].clone()))
+            .collect();
 
         let heap_before_update = pair_heap.len();
         let affected_count = affected_with_counts.len();
@@ -575,53 +607,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut new_pair_deltas: HashMap<Pair, u64> = HashMap::new();
         let updates: Vec<MergeUpdate> = affected_with_counts
             .into_par_iter()
-            .map(|(word, count)| merge_update(word, count, &pair))
+            .map(|(word_id, count, old_word)| {
+                merge_update(word_id, old_word, count, pair, new_token)
+            })
             .collect();
 
-        for update in updates {
-            if update.new_word == update.old_word {
-                *word_counts.entry(update.old_word).or_insert(0) += update.count;
-                continue;
-            }
-            for old_pair in update.old_pairs {
-                *old_pair_deltas.entry(old_pair.clone()).or_insert(0) += update.count;
-                if old_pair != pair {
-                    if let Some(words) = pair_to_words.get_mut(&old_pair) {
-                        words.remove(&update.old_word);
-                        if words.is_empty() {
-                            pair_to_words.remove(&old_pair);
+        for update in &updates {
+            active[update.old_id] = false;
+            word_counts[update.old_id] = 0;
+            word_to_id.remove(&update.old_word);
+            for old_pair in &update.old_pairs {
+                *old_pair_deltas.entry(*old_pair).or_insert(0) += update.count;
+                if *old_pair != pair {
+                    if let Some(ids) = pair_to_words.get_mut(old_pair) {
+                        ids.remove(&update.old_id);
+                        if ids.is_empty() {
+                            pair_to_words.remove(old_pair);
                         }
                     }
                 }
             }
-            *word_counts.entry(update.new_word.clone()).or_insert(0) += update.count;
+        }
+
+        for update in updates {
+            let target_id = if let Some(id) = word_to_id.get(&update.new_word) {
+                *id
+            } else {
+                let id = words.len();
+                words.push(update.new_word.clone());
+                word_counts.push(0);
+                active.push(true);
+                word_to_id.insert(update.new_word.clone(), id);
+                id
+            };
+            word_counts[target_id] += update.count;
             for new_pair in update.new_pairs {
-                *new_pair_deltas.entry(new_pair.clone()).or_insert(0) += update.count;
-                pair_to_words
-                    .entry(new_pair)
-                    .or_default()
-                    .insert(update.new_word.clone());
+                *new_pair_deltas.entry(new_pair).or_insert(0) += update.count;
+                pair_to_words.entry(new_pair).or_default().insert(target_id);
             }
         }
+
         let changed_pairs = old_pair_deltas.len() + new_pair_deltas.len();
         for (old_pair, delta) in old_pair_deltas {
-            dec_pair_count(&mut pair_counts, &mut pair_heap, &old_pair, delta);
+            dec_pair_count(&mut pair_counts, &mut pair_heap, old_pair, delta, &vocab);
         }
         for (new_pair, delta) in new_pair_deltas {
-            inc_pair_count(&mut pair_counts, &mut pair_heap, new_pair, delta);
+            inc_pair_count(&mut pair_counts, &mut pair_heap, new_pair, delta, &vocab);
+        }
+        let mut compacted_heap = false;
+        if pair_heap.len() > pair_counts.len().saturating_mul(8).max(1_000_000) {
+            pair_heap = build_pair_heap(&pair_counts, &vocab);
+            compacted_heap = true;
         }
 
         if progress_interval > 0 && merges.len() % progress_interval == 0 {
+            let active_words = active.iter().filter(|flag| **flag).count();
             eprintln!(
-                "merge {}/{} pair_counts={} heap_entries={} stale_popped={} heap_delta={} changed_pairs={} affected_words={} merge_elapsed={:.2}s workers={} elapsed={:.1}s",
+                "merge {}/{} pair_counts={} heap_entries={} compacted_heap={} stale_popped={} heap_delta={} changed_pairs={} affected_words={} active_words={} merge_elapsed={:.2}s workers={} elapsed={:.1}s",
                 merges.len(),
                 vocab_size.saturating_sub(256 + special_tokens.len()),
                 pair_counts.len(),
                 pair_heap.len(),
+                compacted_heap,
                 stale_popped,
                 pair_heap.len() as i128 - heap_before_update as i128,
                 changed_pairs,
                 affected_count,
+                active_words,
                 merge_start.elapsed().as_secs_f64(),
                 rayon::current_num_threads(),
                 start.elapsed().as_secs_f64()
