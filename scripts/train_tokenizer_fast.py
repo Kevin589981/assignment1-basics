@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 import subprocess
 import sys
@@ -22,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--special-token", action="append", default=None)
     parser.add_argument("--metadata", default=None)
     parser.add_argument("--progress-interval", type=int, default=500)
+    parser.add_argument("--num-workers", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--release", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
@@ -64,6 +66,8 @@ def main() -> None:
             str(args.vocab_size),
             "--progress-interval",
             str(args.progress_interval),
+            "--num-workers",
+            str(args.num_workers),
         ]
         for token in special_tokens:
             cmd.extend(["--special-token", token])
@@ -80,6 +84,7 @@ def main() -> None:
         "special_tokens": special_tokens,
         "num_merges": len(merges),
         "backend": "rust-fast_bpe",
+        "num_workers": args.num_workers,
         "elapsed_sec": time.time() - start,
     }
     if args.metadata is not None:

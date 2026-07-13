@@ -1,3 +1,6 @@
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -8,6 +11,15 @@ use std::time::Instant;
 struct Pair(Vec<u8>, Vec<u8>);
 
 type Word = Vec<Vec<u8>>;
+
+#[derive(Debug)]
+struct MergeUpdate {
+    old_word: Word,
+    new_word: Word,
+    count: u64,
+    old_pairs: Vec<Pair>,
+    new_pairs: Vec<Pair>,
+}
 
 fn is_letter(ch: char) -> bool {
     ch.is_alphabetic()
@@ -134,6 +146,16 @@ fn add_pretoken(bytes: &[u8], counts: &mut HashMap<Word, u64>) {
     *counts.entry(word).or_insert(0) += 1;
 }
 
+fn merge_word_counts(
+    mut left: HashMap<Word, u64>,
+    right: HashMap<Word, u64>,
+) -> HashMap<Word, u64> {
+    for (word, count) in right {
+        *left.entry(word).or_insert(0) += count;
+    }
+    left
+}
+
 fn split_specials<'a>(text: &'a str, special_tokens: &[String]) -> Vec<&'a str> {
     if special_tokens.is_empty() {
         return vec![text];
@@ -181,16 +203,41 @@ fn split_specials<'a>(text: &'a str, special_tokens: &[String]) -> Vec<&'a str> 
 fn build_indexes(
     word_counts: &HashMap<Word, u64>,
 ) -> (HashMap<Pair, u64>, HashMap<Pair, HashSet<Word>>) {
-    let mut pair_counts: HashMap<Pair, u64> = HashMap::new();
-    let mut pair_to_words: HashMap<Pair, HashSet<Word>> = HashMap::new();
-    for (word, count) in word_counts {
-        for pair in word.windows(2) {
-            let p = Pair(pair[0].clone(), pair[1].clone());
-            *pair_counts.entry(p.clone()).or_insert(0) += *count;
-            pair_to_words.entry(p).or_default().insert(word.clone());
-        }
-    }
-    (pair_counts, pair_to_words)
+    word_counts
+        .par_iter()
+        .fold(
+            || {
+                (
+                    HashMap::<Pair, u64>::new(),
+                    HashMap::<Pair, HashSet<Word>>::new(),
+                )
+            },
+            |(mut pair_counts, mut pair_to_words), (word, count)| {
+                for pair in word.windows(2) {
+                    let p = Pair(pair[0].clone(), pair[1].clone());
+                    *pair_counts.entry(p.clone()).or_insert(0) += *count;
+                    pair_to_words.entry(p).or_default().insert(word.clone());
+                }
+                (pair_counts, pair_to_words)
+            },
+        )
+        .reduce(
+            || {
+                (
+                    HashMap::<Pair, u64>::new(),
+                    HashMap::<Pair, HashSet<Word>>::new(),
+                )
+            },
+            |(mut left_counts, mut left_words), (right_counts, right_words)| {
+                for (pair, count) in right_counts {
+                    *left_counts.entry(pair).or_insert(0) += count;
+                }
+                for (pair, words) in right_words {
+                    left_words.entry(pair).or_default().extend(words);
+                }
+                (left_counts, left_words)
+            },
+        )
 }
 
 fn merge_word(word: &[Vec<u8>], pair: &Pair) -> Word {
@@ -221,22 +268,39 @@ fn dec_pair_count(pair_counts: &mut HashMap<Pair, u64>, pair: &Pair, amount: u64
 }
 
 fn best_pair(pair_counts: &HashMap<Pair, u64>) -> Option<Pair> {
-    let mut best: Option<(&Pair, u64)> = None;
-    for (pair, count) in pair_counts {
-        if best.map_or(true, |(old_pair, old_count)| {
-            *count > old_count || (*count == old_count && pair_gt(pair, old_pair))
-        }) {
-            best = Some((pair, *count));
-        }
-    }
-    best.map(|(pair, _)| pair.clone())
+    pair_counts
+        .par_iter()
+        .max_by(|(left_pair, left_count), (right_pair, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| cmp_pair(left_pair, right_pair))
+        })
+        .map(|(pair, _)| pair.clone())
 }
 
-fn pair_gt(a: &Pair, b: &Pair) -> bool {
+fn cmp_pair(a: &Pair, b: &Pair) -> Ordering {
     match a.0.cmp(&b.0) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => a.1 > b.1,
+        Ordering::Equal => a.1.cmp(&b.1),
+        order => order,
+    }
+}
+
+fn merge_update(word: Word, count: u64, pair: &Pair) -> MergeUpdate {
+    let old_pairs = word
+        .windows(2)
+        .map(|old| Pair(old[0].clone(), old[1].clone()))
+        .collect();
+    let new_word = merge_word(&word, pair);
+    let new_pairs = new_word
+        .windows(2)
+        .map(|new| Pair(new[0].clone(), new[1].clone()))
+        .collect();
+    MergeUpdate {
+        old_word: word,
+        new_word,
+        count,
+        old_pairs,
+        new_pairs,
     }
 }
 
@@ -288,12 +352,24 @@ fn write_json(
     fs::write(path, out)
 }
 
-fn parse_args() -> Result<(String, String, usize, Vec<String>, usize, Option<String>), String> {
+fn parse_args() -> Result<
+    (
+        String,
+        String,
+        usize,
+        Vec<String>,
+        usize,
+        usize,
+        Option<String>,
+    ),
+    String,
+> {
     let mut input = None;
     let mut output = None;
     let mut vocab_size = None;
     let mut special_tokens = Vec::new();
     let mut progress_interval = 500usize;
+    let mut num_workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut dump_pretokens = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -301,15 +377,32 @@ fn parse_args() -> Result<(String, String, usize, Vec<String>, usize, Option<Str
             "--input" => input = args.next(),
             "--output-json" => output = args.next(),
             "--vocab-size" => {
-                vocab_size = Some(args.next().ok_or("missing --vocab-size value")?.parse().map_err(|_| "bad vocab size")?)
+                vocab_size = Some(
+                    args.next()
+                        .ok_or("missing --vocab-size value")?
+                        .parse()
+                        .map_err(|_| "bad vocab size")?,
+                )
             }
-            "--special-token" => special_tokens.push(args.next().ok_or("missing --special-token value")?),
+            "--special-token" => {
+                special_tokens.push(args.next().ok_or("missing --special-token value")?)
+            }
             "--progress-interval" => {
                 progress_interval = args
                     .next()
                     .ok_or("missing --progress-interval value")?
                     .parse()
                     .map_err(|_| "bad progress interval")?;
+            }
+            "--num-workers" => {
+                num_workers = args
+                    .next()
+                    .ok_or("missing --num-workers value")?
+                    .parse()
+                    .map_err(|_| "bad num workers")?;
+                if num_workers == 0 {
+                    return Err("--num-workers must be positive".to_string());
+                }
             }
             "--dump-pretokens" => dump_pretokens = args.next(),
             _ => return Err(format!("unknown argument: {}", arg)),
@@ -321,22 +414,36 @@ fn parse_args() -> Result<(String, String, usize, Vec<String>, usize, Option<Str
         vocab_size.ok_or("missing --vocab-size")?,
         special_tokens,
         progress_interval,
+        num_workers,
         dump_pretokens,
     ))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (input, output, vocab_size, special_tokens, progress_interval, dump_pretokens) =
+    let (input, output, vocab_size, special_tokens, progress_interval, num_workers, dump_pretokens) =
         parse_args().map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    ThreadPoolBuilder::new()
+        .num_threads(num_workers)
+        .build_global()
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
     let start = Instant::now();
-    let text = fs::read_to_string(&input)?.replace("\r\n", "\n").replace('\r', "\n");
-    let mut word_counts: HashMap<Word, u64> = HashMap::new();
-    for segment in split_specials(&text, &special_tokens) {
-        pretokenize_segment(segment, &mut word_counts);
-    }
+    let text = fs::read_to_string(&input)?
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let segments = split_specials(&text, &special_tokens);
+    let mut word_counts: HashMap<Word, u64> = segments
+        .par_iter()
+        .map(|segment| {
+            let mut counts = HashMap::new();
+            pretokenize_segment(segment, &mut counts);
+            counts
+        })
+        .reduce(HashMap::new, merge_word_counts);
     eprintln!(
-        "pretokenized unique_words={} elapsed={:.1}s",
+        "pretokenized unique_words={} segments={} workers={} elapsed={:.1}s",
         word_counts.len(),
+        segments.len(),
+        rayon::current_num_threads(),
         start.elapsed().as_secs_f64()
     );
     if let Some(path) = dump_pretokens {
@@ -378,32 +485,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        let mut affected_with_counts = Vec::with_capacity(affected.len());
         for word in affected {
-            let Some(count) = word_counts.remove(&word) else {
-                continue;
-            };
-            let new_word = merge_word(&word, &pair);
-            if new_word == word {
-                *word_counts.entry(word).or_insert(0) += count;
+            if let Some(count) = word_counts.remove(&word) {
+                affected_with_counts.push((word, count));
+            }
+        }
+
+        let updates: Vec<MergeUpdate> = affected_with_counts
+            .into_par_iter()
+            .map(|(word, count)| merge_update(word, count, &pair))
+            .collect();
+
+        for update in updates {
+            if update.new_word == update.old_word {
+                *word_counts.entry(update.old_word).or_insert(0) += update.count;
                 continue;
             }
-            for old in word.windows(2) {
-                let old_pair = Pair(old[0].clone(), old[1].clone());
-                dec_pair_count(&mut pair_counts, &old_pair, count);
+            for old_pair in update.old_pairs {
+                dec_pair_count(&mut pair_counts, &old_pair, update.count);
                 if old_pair != pair {
                     if let Some(words) = pair_to_words.get_mut(&old_pair) {
-                        words.remove(&word);
+                        words.remove(&update.old_word);
                         if words.is_empty() {
                             pair_to_words.remove(&old_pair);
                         }
                     }
                 }
             }
-            *word_counts.entry(new_word.clone()).or_insert(0) += count;
-            for new in new_word.windows(2) {
-                let new_pair = Pair(new[0].clone(), new[1].clone());
-                *pair_counts.entry(new_pair.clone()).or_insert(0) += count;
-                pair_to_words.entry(new_pair).or_default().insert(new_word.clone());
+            *word_counts.entry(update.new_word.clone()).or_insert(0) += update.count;
+            for new_pair in update.new_pairs {
+                *pair_counts.entry(new_pair.clone()).or_insert(0) += update.count;
+                pair_to_words
+                    .entry(new_pair)
+                    .or_default()
+                    .insert(update.new_word.clone());
             }
         }
 

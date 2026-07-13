@@ -37,6 +37,7 @@ if [[ ! -f "$TOKENIZER_OUT" ]]; then
       --output "$TOKENIZER_OUT" \
       --vocab-size "$VOCAB_SIZE" \
       --special-token "<|endoftext|>" \
+      --num-workers "$TOKENIZER_WORKERS" \
       --progress-interval "$PROGRESS_INTERVAL" \
       --metadata "$DATA_DIR/owt_tokenizer_meta.json"
   elif [[ "$TOKENIZER_BACKEND" == "python" ]]; then
