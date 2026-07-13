@@ -20,6 +20,8 @@ VOCAB_SIZE="${VOCAB_SIZE:-32000}"
 DTYPE="${DTYPE:-uint16}"
 TOKENIZER_WORKERS="${TOKENIZER_WORKERS:-40}"
 ENCODE_WORKERS="${ENCODE_WORKERS:-40}"
+TOKENIZER_BACKEND="${TOKENIZER_BACKEND:-python}"
+PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-500}"
 
 mkdir -p "$DATA_DIR"
 
@@ -29,13 +31,26 @@ if [[ ! -f "$TRAIN_TXT" || ! -f "$VAL_TXT" ]]; then
 fi
 
 if [[ ! -f "$TOKENIZER_OUT" ]]; then
-  "$PYTHON" scripts/train_tokenizer.py \
-    --input "$TRAIN_TXT" \
-    --output "$TOKENIZER_OUT" \
-    --vocab-size "$VOCAB_SIZE" \
-    --special-token "<|endoftext|>" \
-    --num-workers "$TOKENIZER_WORKERS" \
-    --metadata "$DATA_DIR/owt_tokenizer_meta.json"
+  if [[ "$TOKENIZER_BACKEND" == "rust" ]]; then
+    "$PYTHON" scripts/train_tokenizer_fast.py \
+      --input "$TRAIN_TXT" \
+      --output "$TOKENIZER_OUT" \
+      --vocab-size "$VOCAB_SIZE" \
+      --special-token "<|endoftext|>" \
+      --progress-interval "$PROGRESS_INTERVAL" \
+      --metadata "$DATA_DIR/owt_tokenizer_meta.json"
+  elif [[ "$TOKENIZER_BACKEND" == "python" ]]; then
+    "$PYTHON" scripts/train_tokenizer.py \
+      --input "$TRAIN_TXT" \
+      --output "$TOKENIZER_OUT" \
+      --vocab-size "$VOCAB_SIZE" \
+      --special-token "<|endoftext|>" \
+      --num-workers "$TOKENIZER_WORKERS" \
+      --metadata "$DATA_DIR/owt_tokenizer_meta.json"
+  else
+    echo "TOKENIZER_BACKEND must be python or rust, got: $TOKENIZER_BACKEND" >&2
+    exit 1
+  fi
 else
   echo "exists: $TOKENIZER_OUT"
 fi
