@@ -1,7 +1,7 @@
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -19,6 +19,26 @@ struct MergeUpdate {
     count: u64,
     old_pairs: Vec<Pair>,
     new_pairs: Vec<Pair>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PairCount {
+    count: u64,
+    pair: Pair,
+}
+
+impl Ord for PairCount {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.count
+            .cmp(&other.count)
+            .then_with(|| cmp_pair(&self.pair, &other.pair))
+    }
+}
+
+impl PartialOrd for PairCount {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 fn is_letter(ch: char) -> bool {
@@ -257,25 +277,69 @@ fn merge_word(word: &[Vec<u8>], pair: &Pair) -> Word {
     merged
 }
 
-fn dec_pair_count(pair_counts: &mut HashMap<Pair, u64>, pair: &Pair, amount: u64) {
-    if let Some(value) = pair_counts.get_mut(pair) {
-        if *value > amount {
-            *value -= amount;
-        } else {
-            pair_counts.remove(pair);
-        }
+fn build_pair_heap(pair_counts: &HashMap<Pair, u64>) -> BinaryHeap<PairCount> {
+    pair_counts
+        .par_iter()
+        .map(|(pair, count)| PairCount {
+            count: *count,
+            pair: pair.clone(),
+        })
+        .collect()
+}
+
+fn push_pair_count(heap: &mut BinaryHeap<PairCount>, pair: &Pair, count: u64) {
+    if count > 0 {
+        heap.push(PairCount {
+            count,
+            pair: pair.clone(),
+        });
     }
 }
 
-fn best_pair(pair_counts: &HashMap<Pair, u64>) -> Option<Pair> {
-    pair_counts
-        .par_iter()
-        .max_by(|(left_pair, left_count), (right_pair, right_count)| {
-            left_count
-                .cmp(right_count)
-                .then_with(|| cmp_pair(left_pair, right_pair))
-        })
-        .map(|(pair, _)| pair.clone())
+fn dec_pair_count(
+    pair_counts: &mut HashMap<Pair, u64>,
+    heap: &mut BinaryHeap<PairCount>,
+    pair: &Pair,
+    amount: u64,
+) {
+    let mut next_count = None;
+    let mut should_remove = false;
+    if let Some(value) = pair_counts.get_mut(pair) {
+        if *value > amount {
+            *value -= amount;
+            next_count = Some(*value);
+        } else {
+            should_remove = true;
+        }
+    }
+    if should_remove {
+        pair_counts.remove(pair);
+    } else if let Some(count) = next_count {
+        push_pair_count(heap, pair, count);
+    }
+}
+
+fn inc_pair_count(
+    pair_counts: &mut HashMap<Pair, u64>,
+    heap: &mut BinaryHeap<PairCount>,
+    pair: Pair,
+    amount: u64,
+) {
+    let count = pair_counts.entry(pair.clone()).or_insert(0);
+    *count += amount;
+    push_pair_count(heap, &pair, *count);
+}
+
+fn best_pair(heap: &mut BinaryHeap<PairCount>, pair_counts: &HashMap<Pair, u64>) -> Option<Pair> {
+    while let Some(entry) = heap.pop() {
+        if pair_counts
+            .get(&entry.pair)
+            .is_some_and(|count| *count == entry.count)
+        {
+            return Some(entry.pair);
+        }
+    }
+    None
 }
 
 fn cmp_pair(a: &Pair, b: &Pair) -> Ordering {
@@ -471,9 +535,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let index_start = Instant::now();
     let (mut pair_counts, mut pair_to_words) = build_indexes(&word_counts);
+    let mut pair_heap = build_pair_heap(&pair_counts);
     eprintln!(
-        "indexed pair_counts={} workers={} elapsed={:.1}s total_elapsed={:.1}s",
+        "indexed pair_counts={} heap_entries={} workers={} elapsed={:.1}s total_elapsed={:.1}s",
         pair_counts.len(),
+        pair_heap.len(),
         rayon::current_num_threads(),
         index_start.elapsed().as_secs_f64(),
         start.elapsed().as_secs_f64()
@@ -481,9 +547,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut merges: Vec<Pair> = Vec::new();
     while vocab.len() < vocab_size {
         let merge_start = Instant::now();
-        let Some(pair) = best_pair(&pair_counts) else {
+        let stale_before = pair_heap.len();
+        let Some(pair) = best_pair(&mut pair_heap, &pair_counts) else {
             break;
         };
+        let stale_popped = stale_before.saturating_sub(pair_heap.len() + 1);
         let mut merged_token = pair.0.clone();
         merged_token.extend_from_slice(&pair.1);
         vocab.push(merged_token);
@@ -501,7 +569,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        let heap_before_update = pair_heap.len();
         let affected_count = affected_with_counts.len();
+        let mut old_pair_deltas: HashMap<Pair, u64> = HashMap::new();
+        let mut new_pair_deltas: HashMap<Pair, u64> = HashMap::new();
         let updates: Vec<MergeUpdate> = affected_with_counts
             .into_par_iter()
             .map(|(word, count)| merge_update(word, count, &pair))
@@ -513,7 +584,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             for old_pair in update.old_pairs {
-                dec_pair_count(&mut pair_counts, &old_pair, update.count);
+                *old_pair_deltas.entry(old_pair.clone()).or_insert(0) += update.count;
                 if old_pair != pair {
                     if let Some(words) = pair_to_words.get_mut(&old_pair) {
                         words.remove(&update.old_word);
@@ -525,20 +596,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             *word_counts.entry(update.new_word.clone()).or_insert(0) += update.count;
             for new_pair in update.new_pairs {
-                *pair_counts.entry(new_pair.clone()).or_insert(0) += update.count;
+                *new_pair_deltas.entry(new_pair.clone()).or_insert(0) += update.count;
                 pair_to_words
                     .entry(new_pair)
                     .or_default()
                     .insert(update.new_word.clone());
             }
         }
+        let changed_pairs = old_pair_deltas.len() + new_pair_deltas.len();
+        for (old_pair, delta) in old_pair_deltas {
+            dec_pair_count(&mut pair_counts, &mut pair_heap, &old_pair, delta);
+        }
+        for (new_pair, delta) in new_pair_deltas {
+            inc_pair_count(&mut pair_counts, &mut pair_heap, new_pair, delta);
+        }
 
         if progress_interval > 0 && merges.len() % progress_interval == 0 {
             eprintln!(
-                "merge {}/{} pair_counts={} affected_words={} merge_elapsed={:.2}s workers={} elapsed={:.1}s",
+                "merge {}/{} pair_counts={} heap_entries={} stale_popped={} heap_delta={} changed_pairs={} affected_words={} merge_elapsed={:.2}s workers={} elapsed={:.1}s",
                 merges.len(),
                 vocab_size.saturating_sub(256 + special_tokens.len()),
                 pair_counts.len(),
+                pair_heap.len(),
+                stale_popped,
+                pair_heap.len() as i128 - heap_before_update as i128,
+                changed_pairs,
                 affected_count,
                 merge_start.elapsed().as_secs_f64(),
                 rayon::current_num_threads(),
