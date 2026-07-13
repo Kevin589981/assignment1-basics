@@ -469,9 +469,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let index_start = Instant::now();
     let (mut pair_counts, mut pair_to_words) = build_indexes(&word_counts);
+    eprintln!(
+        "indexed pair_counts={} workers={} elapsed={:.1}s total_elapsed={:.1}s",
+        pair_counts.len(),
+        rayon::current_num_threads(),
+        index_start.elapsed().as_secs_f64(),
+        start.elapsed().as_secs_f64()
+    );
     let mut merges: Vec<Pair> = Vec::new();
     while vocab.len() < vocab_size {
+        let merge_start = Instant::now();
         let Some(pair) = best_pair(&pair_counts) else {
             break;
         };
@@ -492,6 +501,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        let affected_count = affected_with_counts.len();
         let updates: Vec<MergeUpdate> = affected_with_counts
             .into_par_iter()
             .map(|(word, count)| merge_update(word, count, &pair))
@@ -525,10 +535,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if progress_interval > 0 && merges.len() % progress_interval == 0 {
             eprintln!(
-                "merge {}/{} pair_counts={} elapsed={:.1}s",
+                "merge {}/{} pair_counts={} affected_words={} merge_elapsed={:.2}s workers={} elapsed={:.1}s",
                 merges.len(),
                 vocab_size.saturating_sub(256 + special_tokens.len()),
                 pair_counts.len(),
+                affected_count,
+                merge_start.elapsed().as_secs_f64(),
+                rayon::current_num_threads(),
                 start.elapsed().as_secs_f64()
             );
             io::stderr().flush().ok();
