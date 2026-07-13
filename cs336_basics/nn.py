@@ -216,19 +216,30 @@ class MultiHeadSelfAttention(nn.Module):
         self.k_proj = Linear(d_model, d_model)
         self.v_proj = Linear(d_model, d_model)
         self.output_proj = Linear(d_model, d_model)
+        self.register_buffer(
+            "causal_mask",
+            torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool)),
+            persistent=False,
+        )
+        self.register_buffer("default_token_positions", torch.arange(max_seq_len), persistent=False)
 
     def forward(self, x: Tensor, token_positions: Tensor | None = None) -> Tensor:
-        return multihead_self_attention(
-            x,
-            self.num_heads,
-            self.q_proj.weight,
-            self.k_proj.weight,
-            self.v_proj.weight,
-            self.output_proj.weight,
-            max_seq_len=self.max_seq_len,
-            theta=self.theta,
-            token_positions=token_positions,
-        )
+        *leading, seq_len, d_model = x.shape
+        d_head = d_model // self.num_heads
+        q = linear(x, self.q_proj.weight).reshape(*leading, seq_len, self.num_heads, d_head).transpose(-2, -3)
+        k = linear(x, self.k_proj.weight).reshape(*leading, seq_len, self.num_heads, d_head).transpose(-2, -3)
+        v = linear(x, self.v_proj.weight).reshape(*leading, seq_len, self.num_heads, d_head).transpose(-2, -3)
+        if self.theta is not None:
+            if token_positions is None:
+                token_positions = self.default_token_positions[:seq_len]
+                if leading:
+                    token_positions = token_positions.expand(*leading, seq_len)
+            q = rope(q, self.theta, self.max_seq_len, token_positions.unsqueeze(-2))
+            k = rope(k, self.theta, self.max_seq_len, token_positions.unsqueeze(-2))
+        causal = self.causal_mask[:seq_len, :seq_len]
+        attn = scaled_dot_product_attention(q, k, v, causal)
+        attn = attn.transpose(-2, -3).reshape(*leading, seq_len, d_model)
+        return linear(attn, self.output_proj.weight)
 
 
 class TransformerBlock(nn.Module):

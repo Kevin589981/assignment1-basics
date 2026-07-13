@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-iters", type=int, default=100)
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--status-interval", type=int, default=100)
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
 
     parser.add_argument("--max-lr", type=float, default=3e-4)
@@ -256,6 +257,8 @@ def main() -> None:
 
     use_amp = args.device.startswith("cuda") and args.dtype == "bfloat16"
     start_time = time.time()
+    last_log_time = start_time
+    last_log_tokens = start_step * args.batch_size * args.context_length
     model.train()
 
     iteration = start_step
@@ -264,6 +267,9 @@ def main() -> None:
     write_json(out_dir / "status.json", {"status": status, "step": iteration})
     try:
         for step in range(start_step, args.steps):
+            did_log = False
+            did_eval = False
+            did_checkpoint = False
             lr = lr_cosine_schedule(step, args.max_lr, args.min_lr, args.warmup_iters, args.steps)
             for group in optimizer.param_groups:
                 group["lr"] = lr
@@ -281,9 +287,14 @@ def main() -> None:
             last_train_loss = loss.item()
             tokens = iteration * args.batch_size * args.context_length
             if iteration % args.log_interval == 0 or iteration == 1:
-                elapsed = time.time() - start_time
+                now = time.time()
+                elapsed = now - start_time
                 tokens_per_sec = tokens / elapsed if elapsed > 0 else None
                 mfu = calculate_mfu(tokens_per_sec, flops_per_token, args.peak_flops)
+                interval_elapsed = now - last_log_time
+                interval_tokens = tokens - last_log_tokens
+                interval_tokens_per_sec = interval_tokens / interval_elapsed if interval_elapsed > 0 else None
+                interval_mfu = calculate_mfu(interval_tokens_per_sec, flops_per_token, args.peak_flops)
                 record = {
                     "step": iteration,
                     "split": "train",
@@ -295,9 +306,17 @@ def main() -> None:
                     "tokens_per_sec": tokens_per_sec,
                     "mfu": mfu,
                     "mfu_percent": mfu * 100 if mfu is not None else None,
+                    "interval_sec": interval_elapsed,
+                    "interval_tokens": interval_tokens,
+                    "interval_tokens_per_sec": interval_tokens_per_sec,
+                    "interval_mfu": interval_mfu,
+                    "interval_mfu_percent": interval_mfu * 100 if interval_mfu is not None else None,
                 }
                 write_jsonl(log_path, record)
                 print(json.dumps(record, ensure_ascii=True), flush=True)
+                last_log_time = now
+                last_log_tokens = tokens
+                did_log = True
 
             if iteration % args.eval_interval == 0 or iteration == args.steps:
                 val_loss = estimate_loss(
@@ -330,26 +349,35 @@ def main() -> None:
                 }
                 write_jsonl(log_path, record)
                 print(json.dumps(record, ensure_ascii=True), flush=True)
+                did_eval = True
 
             if iteration % args.checkpoint_interval == 0 or iteration == args.steps:
                 save_checkpoint(model, optimizer, iteration, out_dir / f"ckpt_{iteration:06d}.pt")
                 save_checkpoint(model, optimizer, iteration, out_dir / "ckpt_latest.pt")
                 append_event(out_dir, "checkpoint", step=iteration)
+                did_checkpoint = True
 
-            write_json(
-                out_dir / "run_summary.json",
-                {
-                    "status": "running",
-                    "step": iteration,
-                    "tokens": tokens,
-                    "last_train_loss": last_train_loss,
-                    "best_val_loss": best_val_loss if math.isfinite(best_val_loss) else None,
-                    "best_step": best_step,
-                    "elapsed_sec": time.time() - start_time,
-                    "out_dir": str(out_dir),
-                },
-            )
-            write_json(out_dir / "status.json", {"status": "running", "step": iteration})
+            if (
+                did_log
+                or did_eval
+                or did_checkpoint
+                or iteration % args.status_interval == 0
+                or iteration == args.steps
+            ):
+                write_json(
+                    out_dir / "run_summary.json",
+                    {
+                        "status": "running",
+                        "step": iteration,
+                        "tokens": tokens,
+                        "last_train_loss": last_train_loss,
+                        "best_val_loss": best_val_loss if math.isfinite(best_val_loss) else None,
+                        "best_step": best_step,
+                        "elapsed_sec": time.time() - start_time,
+                        "out_dir": str(out_dir),
+                    },
+                )
+                write_json(out_dir / "status.json", {"status": "running", "step": iteration})
         status = "completed"
         append_event(out_dir, "run_completed", step=iteration)
     except KeyboardInterrupt:
